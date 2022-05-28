@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 import logging
 from sqlalchemy.orm import sessionmaker
-from bot_user import Base
+from bot_data_model import Base
 from sqlalchemy.orm import Session
 
 
