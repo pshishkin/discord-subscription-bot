@@ -16,27 +16,71 @@ from crypto import Crypto
 class SubscriptionBot(commands.Bot):
 
 
-    def __init__(self, command_prefix, guild, crypto: Crypto, updates_frequency, subscription_fee, Session: Session, *args, **kwargs):
+    def __init__(
+            self, 
+            command_prefix, 
+            guild, 
+            crypto: Crypto, 
+            subscription_period,
+            updates_frequency, 
+            subscription_fee,
+            subscription_roles_names, 
+            info_channel_name,
+            Session: Session,
+            *args, **kwargs):
+        
         super(SubscriptionBot, self).__init__(command_prefix, *args, **kwargs)
-        self._GUILD = guild
-        self._Session = Session
-        self._subscription_fee = subscription_fee
-        self._subscription_period = 'minute'
         self._logger = logging.getLogger('subscription_bot.bot')
+        
+        self._GUILD = guild
         self._crypto = crypto
+        assert(subscription_period in ['minute', 'month'])
+        self._subscription_period = subscription_period
         self._updates_frequency = updates_frequency
+        self._subscription_fee = subscription_fee
+        self._subscription_roles_names = subscription_roles_names
+        self._info_channel_name = info_channel_name
+        self._Session = Session
+
+        self.on_ready_finished = False
         
 
     async def on_ready(self):
-        guild = discord.utils.get(self.guilds, name=self._GUILD)
+        self._guild = discord.utils.get(self.guilds, name=self._GUILD)
 
-        assert(guild)
-
+        if not self._guild:
+            raise Exception(f"Can't find guild {self._GUILD} in list of guilds: [{self.guilds}]")
         self._logger.warn(
             f'{self.user} is connected to the following guild: '
-            f'{guild.name}(id: {guild.id})'
+            f'{self._guild.name}(id: {self._guild.id})'
         )
 
+        if not self._subscription_roles_names:
+            raise Exception(f"Specify at least one Role that will be assigned after user subscription")
+
+        self._subscription_roles = []
+        for srn in self._subscription_roles_names:
+            subscription_role = discord.utils.get(self._guild.roles, name=srn)
+            if not subscription_role:
+                raise Exception(f"Can't find role {srn} in roles list: [{self._guild.roles}]")
+            else:
+                self._subscription_roles.append(subscription_role)
+        self._logger.warn(
+            f'Using the following roles: {self._subscription_roles}'
+        )
+
+        all_channels = await self._guild.fetch_channels()
+        info_channels = [x for x in all_channels if x.name == self._info_channel_name]
+        if len(info_channels) == 0:
+            raise Exception(f"Can't find channel {self._info_channel_name} in guild channels: [{all_channels}]")
+        if len(info_channels) >= 2:
+            raise Exception(f"Channel name {self._info_channel_name} is ambigious — found more than one channel with such a name. Consider another channel name.")
+        self._info_channel = info_channels[0]
+        
+        self._logger.warn(f'Using the following info-channel: {self._info_channel}')
+
+        self.on_ready_finished = True
+        
 
     def get_active_subscription_end(self, sess: Session, now: dt, user: User):
         active_subscription_charge = sess.query(Charge).filter(Charge.user_id == user.id, Charge.timestamp <= now, Charge.paid_till > now).first()
@@ -80,35 +124,41 @@ class SubscriptionBot(commands.Bot):
         return user
 
 
-    def update_user_state(self, sess: Session, user: User):
+    async def update_user_state(self, sess: Session, user: User, from_command=True):
+        # from_command is used to understand whether to inform user or not
         now = dt.now()
         active_subscription_end = self.get_active_subscription_end(sess, now, user)
 
         if user.state == UserState.active:
             if not active_subscription_end:
                 period_start, period_end = self._get_active_billing_period(user.active_subscription_start_ts, now)
-                if user.balance >= self._subscription_fee and self.charge_user(sess, user, now, period_start, period_end):
-                    user.state = UserState.active
+                if user.balance >= self._subscription_fee and await self.charge_user(sess, user, now, period_start, period_end):
+                    await self._on_user_subscription_prolonged(user, from_command)
+                    #keep user.state = UserState.active
                 else:
                     user.state = UserState.expired
                     user.active_subscription_start_ts = None
                     user.expired_status_started = dt.now()
+                    await self._on_user_unsubscribed(user, from_command)
 
         elif user.state == UserState.to_be_disabled:
             if not active_subscription_end:
                 user.state = UserState.disabled
                 user.active_subscription_start_ts = None
+                await self._on_user_unsubscribed(user, from_command)
         
         elif user.state == UserState.expired and user.balance >= self._subscription_fee:
-            if self.charge_user(sess, user, now, now, self._get_billing_period_end(now)):
+            if await self.charge_user(sess, user, now, now, self._get_billing_period_end(now)):
                 user.state = UserState.active
                 user.active_subscription_start_ts = now
+                await self._on_user_subscribed(user, from_command)
 
         sess.add(user)
 
 
-    def charge_user(self, sess: Session, user: User, now: dt, period_start: dt, period_end: dt) -> bool:
+    async def charge_user(self, sess: Session, user: User, now: dt, period_start: dt, period_end: dt) -> bool:
         now = dt.now()
+        await self._on_user_charge_attempt(user)
         if self._crypto.sub_balance(user, self._subscription_fee, sess):
             self._logger.info(f'User {user.display_name} was CHARGED for {self._subscription_fee}')
             sess.add(user)
@@ -119,15 +169,58 @@ class SubscriptionBot(commands.Bot):
                 paid_from=period_start,
                 paid_till=period_end)
             sess.add(charge)
+            await self._on_user_charge_success(user)
             return True
         else:
             self._logger.info(f'CANT CHARGE user {user.display_name} was for {self._subscription_fee}')
+            await self._on_user_charge_failure(user)
             return False
+    
+    async def _on_user_subscribed(self, user: User, from_command: bool):
+        member = await self._guild.fetch_member(user.id)
+        self._logger.info(f"adding roles [{self._subscription_roles}] to user {member}")
+        await member.add_roles(*self._subscription_roles)
+        await self._info_channel.send(f'User {user.name} is now subscribed')
+        if from_command == False:
+            res = await member.send(f"""You're now subscribed to "{self._guild.name}". Congrats! """)
 
+    async def _on_user_subscription_prolonged(self, user: User, from_command: bool):
+        member = await self._guild.fetch_member(user.id)
+        await self._info_channel.send(f'User {user.name} subsription is prolonged')
+        if from_command == False:
+            res = await member.send(f"""Your subscription to "{self._guild.name}" was prolonged, thank's for staying with us!""")
+
+    async def _on_user_unsubscribed(self, user: User, from_command: bool):
+        member = await self._guild.fetch_member(user.id)
+        self._logger.info(f"removing roles [{self._subscription_roles}] from user {member}")
+        await member.remove_roles(*self._subscription_roles)
+        await self._info_channel.send(f'User {user.name} is now unsubscribed')
+        if from_command == False:
+            res = await member.send(f"""Your subscription to "{self._guild.name}" was cancelled due to insufficcient funds.""")
+
+    async def _on_user_charge_attempt(self, user: User):
+        await self._info_channel.send(f'Trying to charge {user.name}')
+
+    async def _on_user_charge_success(self, user: User):
+        await self._info_channel.send(f'Successfully charged {user.name}')
+
+    async def _on_user_charge_failure(self, user: User):
+        await self._info_channel.send(f'Failed to charge {user.name}')
 
     def _get_billing_period_end(self, period_start) -> dt:
         if self._subscription_period == 'minute':
             return period_start + td(minutes=1)
+        elif self._subscription_period == 'month':
+            period_end = period_start + td(days=25)
+            while True:
+                if period_end.day == period_start.day:
+                    break
+                next_period_end = period_end + td(days=1)
+                months_diff = next_period_end.month - period_start.month + (next_period_end.year - period_start.year) * 12
+                if months_diff >= 2:
+                    break
+                period_end = next_period_end
+            return period_end
         raise Exception(f"Wrong time period is being used for billing period: {self._subscription_period}")
 
 
@@ -172,28 +265,36 @@ class SubscriptionBot(commands.Bot):
                     # break to make only one first update
                     break
 
-            
-    
+
 def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
-    bot = SubscriptionBot('$', guild, crypto, launch_config['updates_frequency'], launch_config['subscription_fee'], Session)
+    bot = SubscriptionBot(
+        '$', 
+        guild, 
+        crypto, 
+        launch_config['subscription_period'], 
+        launch_config['updates_frequency'], 
+        launch_config['subscription_fee'], 
+        launch_config['roles'],
+        launch_config['info_channel_name'],
+        Session)
     
-    updater = ScheduledUpdater(bot, Session)
 
     with Session() as sess:
         bot.refresh_all_user_updates(sess)
         sess.commit()
 
+    updater = ScheduledUpdater(bot, Session)
 
     @bot.command(name='subscribe', help='Shows you how to subscribe')
     async def subscribe(ctx: Context):
         with Session() as sess:
             user = bot.get_user_and_lock(sess, ctx)
-            bot.update_user_state(sess, user)
+            await bot.update_user_state(sess, user)
 
             if user.state == UserState.disabled:
                 user.state = UserState.expired
                 sess.add(user)
-                bot.update_user_state(sess, user)
+                await bot.update_user_state(sess, user)
                 # it could become here either expired or active
 
             if user.state == UserState.active:
@@ -228,7 +329,7 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
 
         with Session() as sess:
             user = bot.get_user_and_lock(sess, ctx)
-            bot.update_user_state(sess, user)
+            await bot.update_user_state(sess, user)
             if user.state == UserState.expired:
                 user.expired_status_started = dt.now()
                 sess.add(user)
@@ -265,7 +366,7 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
     async def unsubscribe(ctx):
         with Session() as sess:
             user = bot.get_user_and_lock(sess, ctx)
-            bot.update_user_state(sess, user)
+            await bot.update_user_state(sess, user)
 
             if user.state == UserState.disabled:
                 msg = f'Your subscription is already disabled.'
@@ -310,15 +411,19 @@ class ScheduledUpdater(commands.Cog):
 
     @tasks.loop(seconds=5.0)
     async def updater(self):
-        self._logger.info(f'updater iteration {self.index}')
         self.index += 1
+        self._logger.info(f'updater iteration {self.index}')
+        if not self.bot.on_ready_finished:
+            self._logger.info(f'skip updater iteration {self.index} because bot.on_ready_finished is False')
+            return
+        
         with self._Session() as sess:
             for update in sess.query(ScheduledUserUpdate).filter(ScheduledUserUpdate.update_time <= dt.now()):
                 self._logger.info(f'scheduled update for user {update.user.name}')
                 # save here to avoid losing update after deletion 
                 # (i'm not sure whether it will be dropped from the python representation as well)
                 user = self.bot.lock_user(sess, update.user)
-                self.bot.update_user_state(sess, user)
+                await self.bot.update_user_state(sess, user, from_command=False)
                 self.bot.refresh_user_updates(sess, user)
                 sess.commit()
 
