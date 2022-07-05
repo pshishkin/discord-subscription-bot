@@ -44,7 +44,7 @@ LAUNCH_CONFIG_OPTIONS = {
             (td(days=365), td(days=1)),
         },
         'roles': [
-            'Участники',
+            'BotTestRole',
         ],
         'info_channel_name': 'bot-log',
     },
