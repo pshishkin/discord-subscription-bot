@@ -421,7 +421,7 @@ class ScheduledUpdater(commands.Cog):
     def cog_unload(self):
         self.updater.cancel()
 
-    @tasks.loop(seconds=5.0)
+    @tasks.loop(seconds=20.0)
     async def updater(self):
         self.index += 1
         self._logger.info(f'updater iteration {self.index}')
