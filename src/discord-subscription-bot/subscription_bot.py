@@ -11,6 +11,8 @@ from typing import Any
 import logging
 from discord.ext import tasks, commands
 from crypto import Crypto
+import traceback
+import sys
 
 
 class SubscriptionBot(commands.Bot):
@@ -96,30 +98,32 @@ class SubscriptionBot(commands.Bot):
         else:
             return False
 
-    def get_user_and_lock(self, sess: Session, ctx: Context) -> User:
-        # user = sess.get(User, ctx.author.id)
-        user = sess.query(User).filter(User.id == ctx.author.id).with_for_update().first()
+    async def get_user_and_lock(self, sess: Session, ctx: Context) -> User:
+        # user = sess.query(User).filter(User.id == ctx.author.id).with_for_update().first()
+        user = sess.query(User).filter(User.id == ctx.author.id).first()
         if not user:
             user = User(id=ctx.author.id, expired_status_started=dt.now())
+            self._crypto.write_keypair_to_user(user)
             sess.add(user)
             sess.commit()
-            user = sess.query(User).filter(User.id == ctx.author.id).with_for_update().first()
+            # user = sess.query(User).filter(User.id == ctx.author.id).with_for_update().first()
+            user = sess.query(User).filter(User.id == ctx.author.id).first()
         user.display_name = ctx.author.display_name
         user.name = ctx.author.name
 
         sess.add(user)
 
-        self._crypto.init_balance(user)
+        await self._crypto.init_balance(user)
 
         return user
 
-    def lock_user(self, sess: Session, ext_user: User) -> User:
-        # user = sess.get(User, ctx.author.id)
-        user = sess.query(User).filter(User.id == ext_user.id).with_for_update().first()
+    async def lock_user(self, sess: Session, ext_user: User) -> User:
+        # user = sess.query(User).filter(User.id == ext_user.id).with_for_update().first()
+        user = sess.query(User).filter(User.id == ext_user.id).first()
 
         sess.add(user)
 
-        self._crypto.init_balance(user)
+        await self._crypto.init_balance(user)
 
         return user
 
@@ -159,15 +163,17 @@ class SubscriptionBot(commands.Bot):
     async def charge_user(self, sess: Session, user: User, now: dt, period_start: dt, period_end: dt) -> bool:
         now = dt.now()
         await self._on_user_charge_attempt(user)
-        if self._crypto.sub_balance(user, self._subscription_fee, sess):
-            self._logger.info(f'User {user.display_name} was CHARGED for {self._subscription_fee}')
+        tx_hash = await self._crypto.sub_balance(user, self._subscription_fee, sess)
+        if tx_hash:
+            self._logger.info(f'User {user.display_name} was CHARGED for {self._subscription_fee}, tx: {tx_hash}')
             sess.add(user)
             charge = Charge(
                 amount=self._subscription_fee, 
                 user_id=user.id, 
                 timestamp=now, 
                 paid_from=period_start,
-                paid_till=period_end)
+                paid_till=period_end,
+                tx_hash=tx_hash)
             sess.add(charge)
             await self._on_user_charge_success(user)
             return True
@@ -288,7 +294,7 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
     @bot.command(name='subscribe', help='Shows you how to subscribe')
     async def subscribe(ctx: Context):
         with Session() as sess:
-            user = bot.get_user_and_lock(sess, ctx)
+            user = await bot.get_user_and_lock(sess, ctx)
             await bot.update_user_state(sess, user)
 
             if user.state == UserState.disabled:
@@ -300,13 +306,14 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
             if user.state == UserState.active:
                 msg = f"You're subscribed. Next billing date is {bot.get_active_subscription_end(sess, dt.now(), user)}."
                 if user.balance > 0:
-                    msg += f'\n${user.balance} is your current account balance.'
+                    msg += f'\n{user.balance} is your current account balance.'
             
             elif user.state == UserState.expired:
                 balance_shortage = bot._subscription_fee - user.balance
-                msg = f"Top up your balance for at least ${balance_shortage} to start subscription."
+                msg = f"Top up your balance for at least {balance_shortage} {bot._crypto.token_name} to start subscription."
+                msg += f'\nTransfer {bot._crypto.token_name} to {user.keypair.public_key} (Solana network).'
                 if user.balance > 0:
-                    msg += f'\nYou already have ${user.balance} on your account.'
+                    msg += f'\nYou already have {user.balance} {bot._crypto.token_name} on your account.'
             
             elif user.state == UserState.to_be_disabled:
                 user.state = UserState.active
@@ -317,6 +324,7 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
                 user.expired_status_started = dt.now()
                 sess.add(user)
 
+            bot.refresh_user_updates(sess, user)
             sess.commit()
             await ctx.send(msg)
 
@@ -328,33 +336,36 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
         # await bot.send_message(puser, "Your message goes here")
 
         with Session() as sess:
-            user = bot.get_user_and_lock(sess, ctx)
+            user = await bot.get_user_and_lock(sess, ctx)
             await bot.update_user_state(sess, user)
             if user.state == UserState.expired:
                 user.expired_status_started = dt.now()
                 sess.add(user)
+            bot.refresh_user_updates(sess, user)
             sess.commit()
 
             if user.state == UserState.disabled:
                 msg = f'Your subscription is cancelled.'
                 if user.balance > 0:
-                    msg += f'\n${user.balance} is your current account balance.'
+                    msg += f'\n{user.balance} {bot._crypto.token_name} is your current account balance.'
             
             elif user.state == UserState.active:
                 msg = f"You're subscribed. Next billing date is {bot.get_active_subscription_end(sess, dt.now(), user)}."
                 if user.balance > 0:
-                    msg += f'\n${user.balance} is your current account balance.'
+                    msg += f'\n{user.balance} {bot._crypto.token_name} is your current account balance.'
             
             elif user.state == UserState.expired:
                 balance_shortage = bot._subscription_fee - user.balance
                 if bot.is_any_subscription(sess, user):
-                    msg = f"Your subscription has expired. Top up your balance for at least ${balance_shortage} to start subscription."
+                    msg = f"Your subscription has expired. Top up your balance for at least {balance_shortage} {bot._crypto.token_name} to start subscription."
+                    msg += f'\nTransfer {bot._crypto.token_name} to {user.keypair.public_key} (Solana network).'
                     if user.balance > 0:
-                        msg += f'\nYou already have ${user.balance} on your account.'
+                        msg += f'\nYou already have {user.balance} {bot._crypto.token_name} on your account.'
                 else:
                     msg = f"You're not susbscribed yet. Top up your balance for at least ${balance_shortage} to start subscription."
+                    msg += f'\nTransfer {bot._crypto.token_name} to {user.keypair.public_key} (Solana network).'
                     if user.balance > 0:
-                        msg += f'\nYou already have ${user.balance} on your account.'
+                        msg += f'\nYou already have {user.balance} {bot._crypto.token_name} on your account.'
 
 
             elif user.state == UserState.to_be_disabled:
@@ -365,7 +376,7 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
     @bot.command(name='unsubscribe', help='Unsubscribes you')
     async def unsubscribe(ctx):
         with Session() as sess:
-            user = bot.get_user_and_lock(sess, ctx)
+            user = await bot.get_user_and_lock(sess, ctx)
             await bot.update_user_state(sess, user)
 
             if user.state == UserState.disabled:
@@ -382,13 +393,14 @@ def create_bot(guild, Session: Session, crypto: Crypto, launch_config):
             elif user.state == UserState.to_be_disabled:
                 msg = f"Your subsription is due to be cancelled after {bot.get_active_subscription_end(sess, dt.now(), user)}."
 
+            bot.refresh_user_updates(sess, user)
             sess.commit()
             await ctx.send(msg)
             
     @bot.command(name='setbalance')
     async def setbalance(ctx, new_balance: int):
         with Session() as sess:
-            user = bot.get_user_and_lock(sess, ctx)
+            user = await bot.get_user_and_lock(sess, ctx)
             if bot._crypto.set_balance(user, new_balance, sess):
                 sess.commit()
                 await ctx.send(f'Your balance now is {user.balance}')
@@ -417,15 +429,19 @@ class ScheduledUpdater(commands.Cog):
             self._logger.info(f'skip updater iteration {self.index} because bot.on_ready_finished is False')
             return
         
-        with self._Session() as sess:
-            for update in sess.query(ScheduledUserUpdate).filter(ScheduledUserUpdate.update_time <= dt.now()):
-                self._logger.info(f'scheduled update for user {update.user.name}')
-                # save here to avoid losing update after deletion 
-                # (i'm not sure whether it will be dropped from the python representation as well)
-                user = self.bot.lock_user(sess, update.user)
-                await self.bot.update_user_state(sess, user, from_command=False)
-                self.bot.refresh_user_updates(sess, user)
-                sess.commit()
+        try:
+            with self._Session() as sess:
+                for update in sess.query(ScheduledUserUpdate).filter(ScheduledUserUpdate.update_time <= dt.now()):
+                    self._logger.info(f'scheduled update for user {update.user.name}')
+                    # save here to avoid losing update after deletion 
+                    # (i'm not sure whether it will be dropped from the python representation as well)
+                    user = await self.bot.lock_user(sess, update.user)
+                    await self.bot.update_user_state(sess, user, from_command=False)
+                    self.bot.refresh_user_updates(sess, user)
+                    sess.commit()
+        except Exception:
+            self._logger.error('Exception in background user updater')
+            traceback.print_exception(*sys.exc_info())
 
     @updater.before_loop
     async def before_printer(self):

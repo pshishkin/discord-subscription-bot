@@ -1,4 +1,4 @@
-prod_acc_and_transfer.ipynb
+src/discord-subscription-bot/prod_acc_and_transfer.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -104,7 +104,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+src/discord-subscription-bot/.env
 .venv
 env/
 venv/

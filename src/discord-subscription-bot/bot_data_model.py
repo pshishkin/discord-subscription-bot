@@ -1,9 +1,11 @@
 from operator import index
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base, relationship, reconstructor
 from sqlalchemy import Column, BigInteger, Numeric, String, ForeignKey, DateTime
 import enum
 from sqlalchemy import Enum
 from sqlalchemy.sql import func
+from solana.keypair import Keypair
+import json
 
 
 class UserState(enum.Enum):
@@ -26,12 +28,18 @@ class User(Base):
     updates = relationship("ScheduledUserUpdate", back_populates="user")
     charges = relationship("Charge", back_populates="user")
     expired_status_started = Column(DateTime, nullable=False)
+    secret_key_json = Column(String)
 
     def __repr__(self):
         return "<User(id='%d', name='%s')>" % (self.id, self.name)
+    
+    def _load_key(self):
+        self.keypair = Keypair.from_secret_key(bytes(json.loads(self.secret_key_json)))
 
-    def load_balance(self):
-        self.balance = self.balance_dev
+    @reconstructor
+    def init_on_load(self):
+        self._load_key()
+
 
 class Charge(Base):
     __tablename__ = 'charges'
@@ -43,6 +51,8 @@ class Charge(Base):
     paid_till = Column(DateTime, nullable=False)
     user_id = Column(BigInteger, ForeignKey('users.id'))
     user = relationship("User", back_populates="charges")
+    tx_hash = Column(String, nullable=False)
+
 
 
 class ScheduledUserUpdate(Base):
